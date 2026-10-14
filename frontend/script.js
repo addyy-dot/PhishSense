@@ -12,7 +12,7 @@ const navMenu = document.querySelector('.nav-menu');
 
 // Local backend for development.
 // Replace this with your deployed backend URL when deploying.
-const API_URL = 'http://127.0.0.1:5000/predict-url';
+const API_URL = 'https://phishsense-api.onrender.com/predict-url';
 
 function normalizeUrl(url) {
     url = url.trim();
