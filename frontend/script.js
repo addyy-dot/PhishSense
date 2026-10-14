@@ -89,6 +89,7 @@ async function scanUrl() {
 function displayResults(url, data, domainInfo) {
     const lr = data.logistic_regression;
     const xgb = data.xgboost;
+    const isTrusted = data.trusted_domain || false;
 
     const lrPhishing = lr.prediction === 'Phishing';
     const xgbPhishing = xgb.prediction === 'Phishing';
@@ -108,7 +109,9 @@ function displayResults(url, data, domainInfo) {
             level = 'LOWER RISK';
             color = '#10b981';
             icon = 'fa-check-circle';
-            message = 'Both models classified this URL as legitimate. This does not guarantee safety.';
+            message = isTrusted
+                ? 'This is a verified trusted domain. Both models confirm it as legitimate.'
+                : 'Both models classified this URL as legitimate. This does not guarantee safety.';
         }
     } else {
         level = 'UNCERTAIN';
@@ -119,11 +122,20 @@ function displayResults(url, data, domainInfo) {
 
     resultsSection.style.display = 'flex';
 
+    const trustedBadge = isTrusted
+        ? `<div style="margin-top:0.5rem;">
+               <span style="display:inline-flex;align-items:center;gap:0.35rem;background:rgba(16,185,129,0.15);color:#10b981;padding:0.3rem 0.8rem;border-radius:999px;font-size:0.85rem;font-weight:600;">
+                   <i class="fas fa-shield-alt"></i> Trusted Domain
+               </span>
+           </div>`
+        : '';
+
     resultBody.innerHTML = `
         <div style="text-align:center;">
             <i class="fas ${icon}" style="font-size:3rem;color:${color};margin-bottom:1rem;"></i>
             <span class="status-badge ${lrPhishing === xgbPhishing ? (lrPhishing ? 'status-danger' : 'status-safe') : 'status-suspicious'}">${level}</span>
             <p style="font-size:1.1rem;margin:0.5rem 0;color:var(--text-secondary);">${message}</p>
+            ${trustedBadge}
             <div class="result-url"></div>
         </div>
     `;

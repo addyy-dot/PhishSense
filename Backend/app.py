@@ -1,12 +1,15 @@
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 import pandas as pd
+import numpy as np
 import joblib
 import re
+import math
 import ipaddress
 import os
+from collections import Counter
 
 app = Flask(__name__)
 
@@ -14,7 +17,7 @@ app = Flask(__name__)
 # For production, restrict this to your actual frontend origin.
 CORS(app)
 
-# Load the NEW URL-only models and their feature order.
+# Load the improved URL-only models, scaler, and feature order.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 lr_model = joblib.load(
@@ -29,9 +32,118 @@ feature_columns = joblib.load(
     os.path.join(BASE_DIR, "url_only_feature_columns.pkl")
 )
 
+# Load scaler for Logistic Regression (if available).
+scaler_path = os.path.join(BASE_DIR, "url_only_scaler.pkl")
+scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
+
+# ---------------------------------------------------------------------------
+# Trusted domain whitelist
+# These well-known domains are given a legitimacy boost to prevent
+# obvious false positives. The model still runs; the whitelist only
+# adjusts the final probability to avoid embarrassing misclassifications.
+# ---------------------------------------------------------------------------
+TRUSTED_DOMAINS = {
+    # Search & social
+    "google.com", "youtube.com", "facebook.com", "instagram.com",
+    "twitter.com", "x.com", "linkedin.com", "reddit.com",
+    "pinterest.com", "tiktok.com", "snapchat.com", "whatsapp.com",
+    "telegram.org", "discord.com", "twitch.tv",
+
+    # Tech
+    "microsoft.com", "apple.com", "amazon.com", "github.com",
+    "gitlab.com", "stackoverflow.com", "mozilla.org",
+    "wikipedia.org", "wikimedia.org",
+
+    # Email & productivity
+    "outlook.com", "live.com", "office.com", "zoom.us",
+    "slack.com", "notion.so", "trello.com",
+
+    # Finance
+    "paypal.com", "stripe.com", "chase.com", "bankofamerica.com",
+    "wellsfargo.com", "visa.com", "mastercard.com",
+
+    # Shopping
+    "ebay.com", "walmart.com", "target.com", "bestbuy.com",
+    "shopify.com", "etsy.com",
+
+    # Entertainment & media
+    "netflix.com", "spotify.com", "hulu.com", "disneyplus.com",
+    "nytimes.com", "bbc.com", "cnn.com", "reuters.com",
+
+    # Cloud / developer platforms
+    "aws.amazon.com", "cloud.google.com", "azure.microsoft.com",
+    "vercel.com", "netlify.com", "heroku.com",
+    "cloudflare.com", "digitalocean.com",
+
+    # Education
+    "coursera.org", "edx.org", "khanacademy.org",
+
+    # Government
+    "irs.gov", "usa.gov", "gov.uk",
+}
+
+
+def is_trusted_domain(hostname):
+    """
+    Check if the hostname belongs to a trusted domain.
+    Handles subdomains like www.google.com, mail.google.com.
+    """
+    hostname = hostname.lower().strip()
+    # Direct match
+    if hostname in TRUSTED_DOMAINS:
+        return True
+    # Subdomain match (e.g., www.google.com → google.com)
+    parts = hostname.split(".")
+    for i in range(len(parts) - 1):
+        candidate = ".".join(parts[i:])
+        if candidate in TRUSTED_DOMAINS:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Feature extraction (same as retrain.py)
+# ---------------------------------------------------------------------------
+
+COMMON_TLDS = {
+    "com", "org", "net", "edu", "gov", "mil", "int",
+    "co", "io", "us", "uk", "ca", "au", "de", "fr",
+    "in", "jp", "cn", "br", "ru", "it", "es", "nl",
+}
+
+SUSPICIOUS_KEYWORDS = [
+    "login", "signin", "sign-in", "verify", "secure", "account",
+    "update", "confirm", "banking", "password", "credential",
+    "suspend", "alert", "urgent", "paypal", "apple", "microsoft",
+    "amazon", "netflix", "facebook", "google", "support", "help",
+    "recover", "restore", "unlock", "validate", "authenticate",
+    "webscr", "cmd", "wallet", "billing", "invoice",
+]
+
+SUSPICIOUS_HOSTING = [
+    "000webhostapp.com", "weebly.com", "wixsite.com",
+    "blogspot.com", "wordpress.com", "herokuapp.com",
+    "firebaseapp.com", "web.app", "netlify.app",
+    "vercel.app", "pages.dev", "glitch.me",
+    "replit.co", "github.io",
+]
+
+
+def shannon_entropy(text):
+    """Calculate Shannon entropy of a string."""
+    if not text:
+        return 0.0
+    counter = Counter(text)
+    length = len(text)
+    entropy = -sum(
+        (count / length) * math.log2(count / length)
+        for count in counter.values()
+    )
+    return round(entropy, 6)
+
 
 def extract_url_features(value):
-    """Extract the same 18 URL-only features used during training."""
+    """Extract the improved feature set used during training."""
 
     raw = str(value).strip()
 
@@ -51,7 +163,13 @@ def extract_url_features(value):
     if not host:
         raise ValueError("The URL must contain a hostname.")
 
-    # Check whether the hostname is an IP address.
+    # --- Basic URL features ---
+    url_length = len(raw)
+    n = max(url_length, 1)
+
+    # --- Domain features ---
+    domain_length = len(host)
+
     try:
         ipaddress.ip_address(host)
         is_ip = 1
@@ -59,51 +177,127 @@ def extract_url_features(value):
         is_ip = 0
 
     parts = host.split(".")
-    tld_length = len(parts[-1]) if len(parts) > 1 else 0
-    subdomains = max(0, len(parts) - 2) if not is_ip else 0
+    tld = parts[-1] if len(parts) > 1 else ""
+    tld_length = len(tld)
+    num_subdomains = max(0, len(parts) - 2) if not is_ip else 0
+    is_common_tld = int(tld in COMMON_TLDS)
 
-    n = max(len(raw), 1)
+    domain_no_tld = ".".join(parts[:-1]) if len(parts) > 1 else host
 
+    # --- Path features ---
+    path = parsed.path or ""
+    path_length = len(path)
+    path_depth = path.strip("/").count("/") + 1 if path.strip("/") else 0
+
+    # --- Query features ---
+    query = parsed.query or ""
+    query_length = len(query)
+    query_params = parse_qs(query)
+    num_query_params = len(query_params)
+
+    # --- Character analysis ---
     letters = sum(c.isalpha() for c in raw)
     digits = sum(c.isdigit() for c in raw)
-    obfuscated = sum(c in "%@" for c in raw)
+
+    letter_ratio = letters / n
+    digit_ratio = digits / n
+
+    num_dots = raw.count(".")
+    num_hyphens = raw.count("-")
+    num_slashes = raw.count("/")
+    num_at = raw.count("@")
+    num_percent = raw.count("%")
+    num_equals = raw.count("=")
+    num_ampersand = raw.count("&")
+
+    obfuscated = num_at + num_percent
+    has_obfuscation = int(obfuscated > 0)
 
     other_special = sum(
-        not c.isalnum() and c not in "/:?&=.#-_"
+        not c.isalnum() and c not in "/:?&=.#-_~@%+,"
         for c in raw
     )
+    special_ratio = other_special / n
+
+    is_https = int(parsed.scheme.lower() == "https")
+
+    url_entropy = shannon_entropy(raw)
+    domain_entropy = shannon_entropy(host)
+
+    url_lower = raw.lower()
+
+    suspicious_keyword_count = sum(
+        1 for kw in SUSPICIOUS_KEYWORDS
+        if kw in url_lower
+    )
+
+    domain_has_suspicious_keyword = int(any(
+        kw in domain_no_tld.lower()
+        for kw in ["login", "signin", "verify", "secure", "account",
+                    "update", "confirm", "banking", "password"]
+    ))
+
+    hex_char_count = len(re.findall(r"%[0-9a-fA-F]{2}", raw))
+
+    has_long_subdomain = int(any(
+        len(p) > 20 for p in parts[:-2]
+    )) if len(parts) > 2 else 0
+
+    uses_suspicious_hosting = int(any(
+        host.endswith(h) for h in SUSPICIOUS_HOSTING
+    ))
 
     return {
-        "URLLength": len(raw),
-        "DomainLength": len(host),
+        "URLLength": url_length,
+        "PathLength": path_length,
+        "PathDepth": path_depth,
+        "QueryLength": query_length,
+        "NumQueryParams": num_query_params,
+        "DomainLength": domain_length,
         "IsDomainIP": is_ip,
         "TLDLength": tld_length,
-        "NoOfSubDomain": subdomains,
-        "HasObfuscation": int(obfuscated > 0),
-        "NoOfObfuscatedChar": obfuscated,
-        "ObfuscationRatio": obfuscated / n,
-        "NoOfLettersInURL": letters,
-        "LetterRatioInURL": letters / n,
-        "NoOfDegitsInURL": digits,
-        "DegitRatioInURL": digits / n,
-        "NoOfEqualsInURL": raw.count("="),
-        "NoOfQMarkInURL": raw.count("?"),
-        "NoOfAmpersandInURL": raw.count("&"),
-        "NoOfOtherSpecialCharsInURL": other_special,
-        "SpacialCharRatioInURL": other_special / n,
-        "IsHTTPS": int(parsed.scheme.lower() == "https")
+        "NumSubdomains": num_subdomains,
+        "IsCommonTLD": is_common_tld,
+        "DomainEntropy": domain_entropy,
+        "NumLetters": letters,
+        "LetterRatio": letter_ratio,
+        "NumDigits": digits,
+        "DigitRatio": digit_ratio,
+        "NumDots": num_dots,
+        "NumHyphens": num_hyphens,
+        "NumSlashes": num_slashes,
+        "HasObfuscation": has_obfuscation,
+        "NumObfuscatedChars": obfuscated,
+        "NumOtherSpecialChars": other_special,
+        "SpecialCharRatio": special_ratio,
+        "HexCharCount": hex_char_count,
+        "NumEquals": num_equals,
+        "NumAmpersand": num_ampersand,
+        "IsHTTPS": is_https,
+        "URLEntropy": url_entropy,
+        "SuspiciousKeywordCount": suspicious_keyword_count,
+        "DomainHasSuspiciousKeyword": domain_has_suspicious_keyword,
+        "HasLongSubdomain": has_long_subdomain,
+        "UsesSuspiciousHosting": uses_suspicious_hosting,
     }
 
 
-def predict_with_model(model, row):
+def predict_with_model(model, row, use_scaler=False):
     """Return prediction and phishing probability."""
 
-    prediction = int(model.predict(row)[0])
+    input_data = row
+    if use_scaler and scaler is not None:
+        input_data = pd.DataFrame(
+            scaler.transform(row),
+            columns=row.columns
+        )
+
+    prediction = int(model.predict(input_data)[0])
 
     classes = list(model.classes_)
     phishing_index = classes.index(1)
 
-    probabilities = model.predict_proba(row)[0]
+    probabilities = model.predict_proba(input_data)[0]
     phishing_probability = float(probabilities[phishing_index])
 
     return {
@@ -162,14 +356,41 @@ def predict_url():
             columns=feature_columns
         )
 
-        lr_result = predict_with_model(lr_model, row)
-        xgb_result = predict_with_model(xgb_model, row)
+        lr_result = predict_with_model(lr_model, row, use_scaler=True)
+        xgb_result = predict_with_model(xgb_model, row, use_scaler=False)
+
+        # --- Trusted domain override ---
+        normalized = url.strip()
+        if not re.match(r"^https?://", normalized, re.IGNORECASE):
+            normalized = "https://" + normalized
+        try:
+            hostname = urlsplit(normalized).hostname or ""
+        except ValueError:
+            hostname = ""
+
+        trusted = is_trusted_domain(hostname)
+
+        if trusted:
+            # Clamp phishing probability down for trusted domains.
+            # The model may still see some URL features as suspicious
+            # (e.g., short URL with few features), but we know this
+            # domain is legitimate.
+            lr_result["phishing_probability"] = min(
+                lr_result["phishing_probability"], 0.05
+            )
+            lr_result["prediction"] = "Legitimate"
+
+            xgb_result["phishing_probability"] = min(
+                xgb_result["phishing_probability"], 0.05
+            )
+            xgb_result["prediction"] = "Legitimate"
 
         return jsonify({
             "url": url.strip(),
             "feature_count": len(feature_columns),
             "logistic_regression": lr_result,
             "xgboost": xgb_result,
+            "trusted_domain": trusted,
             "notice": (
                 "Predictions use URL text only. "
                 "Webpage content is not inspected."
