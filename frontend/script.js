@@ -10,8 +10,7 @@ const navLinks = document.querySelectorAll('.nav-link');
 const hamburger = document.querySelector('.hamburger');
 const navMenu = document.querySelector('.nav-menu');
 
-// Local backend for development.
-// Replace this with your deployed backend URL when deploying.
+// Production backend on Render
 const API_URL = 'https://phishsense-api.onrender.com/predict-url';
 
 function normalizeUrl(url) {
