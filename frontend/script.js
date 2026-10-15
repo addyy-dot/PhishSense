@@ -252,16 +252,6 @@ document.querySelector('form')?.addEventListener('submit', event => {
 document.addEventListener('DOMContentLoaded', () => {
     console.log('PhishSense initialized');
     urlInput?.focus();
-
-    const observer = new IntersectionObserver(entries => {
-        entries.forEach(entry => {
-            if (entry.isIntersecting) entry.target.classList.add('fade-in');
-        });
-    }, { threshold: 0.1 });
-
-    document.querySelectorAll('.about-card, .stat-item').forEach(item => {
-        observer.observe(item);
-    });
 });
 
 // Dark mode preference
